@@ -228,10 +228,6 @@ Everything downstream (token scoring, eviction, variable-length KV cache handlin
 - Successful zero-shot transfer: train on Llama, evaluate on Qwen without retraining.
 - Stackability demonstration: show gains from combining learned budgets + KV Policy's learned eviction.
 
-### 8.3 CV Signal
-
-Regardless of absolute performance gains, this project demonstrates: RL for systems optimization (a hot skill), deep understanding of transformer attention mechanics, ability to identify and fill research gaps, and engineering competence integrating with production-grade frameworks (KVPress). The budget heatmap visualizations alone are compelling in a portfolio.
-
 ---
 
 ## 9. Key References
