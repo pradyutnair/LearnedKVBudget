@@ -53,7 +53,9 @@ def compute_attention_entropy(attentions: torch.Tensor, eps: float = 1e-8) -> to
     TODO(phase1): confirm whether to aggregate over batch before or after logging.
     """
     validate_attention_shape(attentions)
+    # Clamp probabilities to avoid log(0)
     probs = attentions.clamp_min(eps)
+    # Compute entropy per query, then average over queries
     entropy_per_query = -(probs * probs.log()).sum(dim=-1)  # (B, H, Q)
     return entropy_per_query.mean(dim=-1)  # (B, H)
 
@@ -71,6 +73,7 @@ def compute_topk_attention_mass(
     - Option B: derive k from current per-head budget candidate
     """
     validate_attention_shape(attentions)
+    # Compute top-k values, then sum over keys and average over queries
     key_len = attentions.shape[-1]
     k = max(1, int(key_len * topk_fraction))
     topk_vals, _ = torch.topk(attentions, k=k, dim=-1)
@@ -109,10 +112,10 @@ def build_feature_tensor(
     alignment strategy before training.
     """
     parts = [
-        attention_entropy.unsqueeze(-1),
-        topk_attention_mass.unsqueeze(-1),
-        key_norm_variance.unsqueeze(-1),
-        adakv_l1_score.unsqueeze(-1),
+        attention_entropy.unsqueeze(-1), # (B, H, 1)
+        topk_attention_mass.unsqueeze(-1), # (B, H, 1)
+        key_norm_variance.unsqueeze(-1), # (B, H, 1)
+        adakv_l1_score.unsqueeze(-1), # (B, H, 1)
     ]
-    return torch.cat(parts, dim=-1)
+    return torch.cat(parts, dim=-1) # (B, H, 4)
 

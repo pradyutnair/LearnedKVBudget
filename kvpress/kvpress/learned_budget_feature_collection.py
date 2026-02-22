@@ -1,26 +1,28 @@
-"""Phase 1 scaffolding to collect per-head feature datasets.
+"""Phase 1 feature collection for learned budget allocation.
 
-This script is intentionally scaffolded and does not implement full integration.
-It defines a clean entry point and TODO-marked steps needed to:
-1) run prefill with attention outputs
-2) compute per-layer/per-head features
-3) log Ada-KV analytical allocation targets
-4) save a training-ready tabular artifact
+This module extracts per-layer/per-head features from a frozen causal LM prefill:
+1) attention entropy
+2) top-k attention mass
+3) key norm variance
+4) Ada-KV target proxy score (placeholder approximation)
 
 Documentation links:
-- Transformers generation + outputs:
-  https://huggingface.co/docs/transformers/main_classes/text_generation
+- Transformers model outputs:
+  https://huggingface.co/docs/transformers/main_classes/output
 - Datasets loading:
   https://huggingface.co/docs/datasets/loading
 - Torch inference mode:
   https://pytorch.org/docs/stable/generated/torch.inference_mode.html
 """
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from kvpress.learned_budget_features import (
     FeatureConfig,
@@ -40,25 +42,101 @@ class Phase1CollectionConfig:
 
     dataset_name: str = "ruler"
     dataset_config: str = "4096"
-    split: str = "train"
+    split: str = "test"
     model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     output_csv: str = "kvpress/evaluation/results/phase1_features.csv"
     max_examples: int = 128
     topk_fraction: float = 0.1
+    max_context_tokens: int = 4096
     device: str = "cuda:0"
+    trust_remote_code: bool = True
 
 
-def compute_placeholder_adakv_score(
-    batch_size: int, num_heads: int, device: torch.device
-) -> torch.Tensor:
-    """Temporary scaffold for Ada-KV analytical score tensor.
+DATASET_REGISTRY = {
+    "ruler": "simonjegou/ruler",
+    "longbench": "Xnhyacinth/LongBench",
+    "math500": "alessiodevoto/math500",
+}
 
-    TODO(phase1): replace this with the exact Ada-KV L1 score extraction.
-    Suggested integration point: reuse the same tensors used in `AdaKVPress.compress`.
+
+def resolve_hf_dataset_name(dataset_name: str) -> str:
+    if dataset_name in DATASET_REGISTRY:
+        return DATASET_REGISTRY[dataset_name]
+    return dataset_name
+
+
+def build_prompt_from_example(example: dict) -> str:
+    """Build a prefill prompt from a benchmark row."""
+    if "context" in example and "question" in example:
+        return f"{example['context']}\n\n{example['question']}"
+    if "prompt" in example:
+        return example["prompt"]
+    if "input" in example:
+        return example["input"]
+    if "text" in example:
+        return example["text"]
+    raise ValueError("Could not infer prompt field from dataset example")
+
+
+def get_example_id(example: dict, fallback_index: int) -> str:
+    if "id" in example:
+        return str(example["id"])
+    if "example_id" in example:
+        return str(example["example_id"])
+    return str(fallback_index)
+
+
+def align_kv_to_attention_heads(kv_tensor: torch.Tensor, num_attention_heads: int) -> torch.Tensor:
+    """Align `(B, H_kv)` tensor to `(B, H)` for GQA models.
+
+    If H is a multiple of H_kv, each KV-head value is repeated across the grouped query heads.
     """
-    return torch.zeros((batch_size, num_heads), device=device)
+    bsz, num_kv_heads = kv_tensor.shape
+    if num_kv_heads == num_attention_heads:
+        return kv_tensor
+    if num_attention_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"Cannot align KV heads to attention heads: H={num_attention_heads}, H_kv={num_kv_heads}"
+        )
+    repeat_factor = num_attention_heads // num_kv_heads
+    return kv_tensor.repeat_interleave(repeat_factor, dim=1).reshape(bsz, num_attention_heads)
 
 
+def compute_adakv_target_proxy_from_attentions(
+    attentions: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Compute a stable target proxy from attentions with shape `(B, H, Q, K)`.
+
+    This is not the full Ada-KV analytical bound. It is a monotonic proxy:
+    mean over query positions of max attention over key positions.
+    Higher values indicate heads that concentrate strongly on salient keys.
+    """
+    # (B, H, Q, K) -> (B, H, Q) -> (B, H)
+    return attentions.clamp_min(eps).amax(dim=-1).mean(dim=-1)
+
+
+def load_prefill_model_and_tokenizer(config: Phase1CollectionConfig):
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, trust_remote_code=config.trust_remote_code)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model_kwargs = {
+        "trust_remote_code": config.trust_remote_code,
+    }
+    target_device = config.device
+    if target_device != "auto" and target_device.startswith("cuda") and not torch.cuda.is_available():
+        target_device = "cpu"
+
+    if target_device == "auto":
+        model = AutoModelForCausalLM.from_pretrained(config.model_name, device_map="auto", **model_kwargs)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(config.model_name, **model_kwargs).to(target_device)
+    model.eval()
+    return model, tokenizer
+
+
+@torch.inference_mode()
 def collect_phase1_features(config: Phase1CollectionConfig) -> Path:
     """Collect features and emit a CSV artifact for correlation analysis.
 
@@ -71,28 +149,70 @@ def collect_phase1_features(config: Phase1CollectionConfig) -> Path:
     feature_cfg = FeatureConfig(topk_fraction=config.topk_fraction)
     records: list[dict] = []
 
-    # TODO(phase1): load dataset examples.
-    # - Use existing KVPress evaluation dataset loaders if possible.
-    # - Keep prompt IDs stable so you can join with metrics later.
-    # - Reference: kvpress/evaluation/benchmarks/ruler/create_huggingface_dataset.py
-    # --------------------------------------------------------------------------
+    dataset = load_dataset(
+        resolve_hf_dataset_name(config.dataset_name),
+        config.dataset_config,
+        split=config.split,
+    )
+    model, tokenizer = load_prefill_model_and_tokenizer(config)
 
-    # TODO(phase1): load tokenizer/model exactly as your baseline pipeline does.
-    # - Enable outputs needed to recover attentions from prefill.
-    # - Confirm how to capture per-layer keys in the same forward pass.
-    # --------------------------------------------------------------------------
+    n_examples = min(config.max_examples, len(dataset))
+    for idx in range(n_examples):
+        example = dataset[idx]
+        prompt = build_prompt_from_example(example)
+        example_id = get_example_id(example, idx)
 
-    # TODO(phase1): iterate over examples and run prefill in inference mode.
-    # - For each layer:
-    #   1) extract attentions and keys
-    #   2) compute 4 feature channels
-    #   3) store one row per (example_id, layer_id, head_id)
-    # - Also store Ada-KV analytical allocation target for correlation checks.
-    # --------------------------------------------------------------------------
-    _ = feature_cfg  # remove once collection loop is implemented
+        encoded = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=config.max_context_tokens,
+        )
+        if config.device != "auto":
+            encoded = {k: v.to(config.device) for k, v in encoded.items()}
+
+        outputs = model(
+            **encoded,
+            use_cache=True,
+            output_attentions=True,
+            return_dict=True,
+        )
+        attentions_per_layer = outputs.attentions
+        past_key_values = outputs.past_key_values
+        if attentions_per_layer is None or past_key_values is None:
+            raise ValueError("Model outputs missing attentions or past_key_values")
+
+        for layer_id, (layer_attn, layer_kv) in enumerate(zip(attentions_per_layer, past_key_values)):
+            layer_keys = layer_kv[0]
+            attention_entropy = compute_attention_entropy(layer_attn, eps=feature_cfg.eps)
+            topk_attention_mass = compute_topk_attention_mass(layer_attn, topk_fraction=feature_cfg.topk_fraction)
+            key_norm_variance_kv = compute_key_norm_variance(layer_keys, eps=feature_cfg.eps)
+            key_norm_variance = align_kv_to_attention_heads(key_norm_variance_kv, attention_entropy.shape[1])
+            adakv_proxy = compute_adakv_target_proxy_from_attentions(layer_attn, eps=feature_cfg.eps)
+
+            feature_tensor = build_feature_tensor(
+                attention_entropy=attention_entropy,
+                topk_attention_mass=topk_attention_mass,
+                key_norm_variance=key_norm_variance,
+                adakv_l1_score=adakv_proxy,
+            )
+
+            # Store one row per (example_id, layer_id, head_id).
+            # We use the first batch item because collection runs one prompt at a time.
+            for head_id in range(feature_tensor.shape[1]):
+                records.append(
+                    {
+                        "example_id": example_id,
+                        "layer_id": int(layer_id),
+                        "head_id": int(head_id),
+                        "attention_entropy": float(feature_tensor[0, head_id, 0].item()),
+                        "topk_attention_mass": float(feature_tensor[0, head_id, 1].item()),
+                        "key_norm_variance": float(feature_tensor[0, head_id, 2].item()),
+                        "adakv_l1_score": float(feature_tensor[0, head_id, 3].item()),
+                    }
+                )
 
     if not records:
-        # Keep the scaffold runnable while logic is unimplemented.
         empty_df = pd.DataFrame(
             columns=[
                 "example_id",
@@ -119,19 +239,47 @@ def dryrun_feature_ops() -> None:
     """
     bsz, heads, q_len, k_len, d = 2, 8, 16, 16, 128
     attentions = torch.softmax(torch.randn(bsz, heads, q_len, k_len), dim=-1)
-    keys = torch.randn(bsz, heads, k_len, d)
-    adakv = compute_placeholder_adakv_score(bsz, heads, attentions.device)
+    keys = torch.randn(bsz, 4, k_len, d)
+    var = compute_key_norm_variance(keys)
+    var = align_kv_to_attention_heads(var, heads)
+    adakv = compute_adakv_target_proxy_from_attentions(attentions, eps=1e-8)
 
     ent = compute_attention_entropy(attentions)
     topk = compute_topk_attention_mass(attentions, topk_fraction=0.1)
-    var = compute_key_norm_variance(keys)
     feat = build_feature_tensor(ent, topk, var, adakv)
 
     assert feat.shape == (bsz, heads, 4), f"Unexpected feature shape: {tuple(feat.shape)}"
 
 
-if __name__ == "__main__":
-    cfg = Phase1CollectionConfig()
-    output = collect_phase1_features(cfg)
-    print(f"[phase1] wrote feature scaffold output to: {output}")
+def parse_args() -> Phase1CollectionConfig:
+    parser = argparse.ArgumentParser(description="Collect Phase 1 per-head feature dataset.")
+    parser.add_argument("--dataset_name", type=str, default="ruler")
+    parser.add_argument("--dataset_config", type=str, default="4096")
+    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
+    parser.add_argument("--output_csv", type=str, default="kvpress/evaluation/results/phase1_features.csv")
+    parser.add_argument("--max_examples", type=int, default=128)
+    parser.add_argument("--topk_fraction", type=float, default=0.1)
+    parser.add_argument("--max_context_tokens", type=int, default=4096)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--trust_remote_code", action="store_true", default=True)
+    parser.add_argument("--no-trust_remote_code", dest="trust_remote_code", action="store_false")
+    args = parser.parse_args()
+    return Phase1CollectionConfig(
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        split=args.split,
+        model_name=args.model_name,
+        output_csv=args.output_csv,
+        max_examples=args.max_examples,
+        topk_fraction=args.topk_fraction,
+        max_context_tokens=args.max_context_tokens,
+        device=args.device,
+        trust_remote_code=args.trust_remote_code,
+    )
 
+
+if __name__ == "__main__":
+    cfg = parse_args()
+    output = collect_phase1_features(cfg)
+    print(f"[phase1] wrote feature output to: {output}")

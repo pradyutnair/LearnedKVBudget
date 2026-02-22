@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --job-name=ev_ada
+#SBATCH --output=/projects/prjs1800/tmp/LearnedKVBudget/jobs/output/ev_ada.log
+#SBATCH --time=10:00:00
+#SBATCH --partition=gpu_a100
+#SBATCH --gpus=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+
+source /projects/prjs1800/venvs/kvpress/bin/activate
+export HF_HOME=/projects/prjs1800/.cache/huggingface
+export HF_DATASETS_CACHE=/projects/prjs1800/.cache/huggingface
+
+# Ensure kvpress and deps (numpy, etc.) are installed in the venv
+uv pip install -e "/projects/prjs1800/tmp/LearnedKVBudget/kvpress[eval]"
+
+cd /projects/prjs1800/tmp/LearnedKVBudget/kvpress/evaluation
+
+dataset="ruler"
+data_dir="4096"
+model="Qwen/Qwen2.5-7B-Instruct"
+compression_ratios=(0.2 0.4 0.6)
+press_name="adakv_snapkv"
+
+for compression_ratio in "${compression_ratios[@]}"; do
+  echo "Running press_name: $press_name with compression_ratio: $compression_ratio on cuda:0"
+  python evaluate.py --dataset $dataset --data_dir $data_dir --model $model --press_name $press_name --compression_ratio $compression_ratio --device cuda:0 --fraction 0.01
+done
+echo "All evaluations completed."

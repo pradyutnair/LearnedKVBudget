@@ -71,8 +71,10 @@ def run_phase1_analysis(config: Phase1AnalysisConfig) -> Path:
     # - Jensen-Shannon divergence vs uniform allocations
     # - correlation with actual budget-per-head from Ada-KV pipeline
     # --------------------------------------------------------------------------
+    print(f"[phase1] reading feature CSV from: {in_path}")
     df = pd.read_csv(in_path)
     summary = compute_layerwise_correlations(df)
+    print(f"[phase1] writing correlation summary to: {out_path}")
     summary.to_csv(out_path, index=False)
     return out_path
 

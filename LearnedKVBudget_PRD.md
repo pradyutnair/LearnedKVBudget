@@ -2,14 +2,16 @@
 
 **RL-Based Per-Head KV Cache Budget Allocation via GRPO**
 
-| | |
-|---|---|
-| **Author** | Pradyut Nair |
-| **Affiliation** | Prosus / University of Amsterdam |
-| **Date** | February 2026 |
-| **Timeline** | 14 days (2 weeks) |
-| **Compute** | Snellius (NVIDIA A100 cluster) |
-| **Status** | Planning |
+
+|                 |                                |
+| --------------- | ------------------------------ |
+| **Author**      | Pradyut Nair                   |
+| **Affiliation** | University of Amsterdam        |
+| **Date**        | February 2026                  |
+| **Timeline**    | 14 days (2 weeks)              |
+| **Compute**     | Snellius (NVIDIA A100 cluster) |
+| **Status**      | Planning                       |
+
 
 ---
 
@@ -49,14 +51,16 @@ None of these learn which heads should get more or fewer tokens as a function of
 
 The following table decomposes the design space into four dimensions and shows where each method sits. Our contribution occupies the only unoccupied cell: learned, input-dependent, continuous inter-head budget allocation.
 
-| Dimension | RLKV | KV Policy | ForesightKV | **Ours** |
-|---|---|---|---|---|
+
+| Dimension       | RLKV                    | KV Policy                     | ForesightKV                 | **Ours**                      |
+| --------------- | ----------------------- | ----------------------------- | --------------------------- | ----------------------------- |
 | What is learned | Static binary head mask | Per-token ranking within head | Per-token importance scores | **Per-head budget fractions** |
-| Action space | Binary gate per head | Token ranking per head | Token scores (global) | **Continuous vector b ∈ ℝᴴ** |
-| Budget type | Fixed (full vs. local) | Uniform across heads | Fixed global budget | **Input-dependent per head** |
-| Input-dependent | No (same mask for all) | Yes (token features) | Yes (token features) | **Yes (head statistics)** |
-| RL algorithm | PPO + L1 penalty | Custom RL reward | GRPO (MDP) | **GRPO** |
-| Complementary? | Orthogonal | Stackable | Stackable | **—** |
+| Action space    | Binary gate per head    | Token ranking per head        | Token scores (global)       | **Continuous vector b ∈ ℝᴴ**  |
+| Budget type     | Fixed (full vs. local)  | Uniform across heads          | Fixed global budget         | **Input-dependent per head**  |
+| Input-dependent | No (same mask for all)  | Yes (token features)          | Yes (token features)        | **Yes (head statistics)**     |
+| RL algorithm    | PPO + L1 penalty        | Custom RL reward              | GRPO (MDP)                  | **GRPO**                      |
+| Complementary?  | Orthogonal              | Stackable                     | Stackable                   | **—**                         |
+
 
 **Key insight:** Our method is complementary to all three. RLKV decides which heads matter at all; KV Policy and ForesightKV decide which tokens matter within a head; we decide how much budget each head gets. These can be stacked: our allocator outputs budget fractions, then KV Policy's agents rank tokens within each head's allocation.
 
@@ -69,9 +73,7 @@ The following table decomposes the design space into four dimensions and shows w
 The system has three components that execute sequentially during inference:
 
 1. **Feature extractor:** After prefill, extract per-head summary statistics from the KV cache and attention patterns. These are cheap to compute and already available in the attention forward pass.
-
 2. **Budget allocator network πθ:** A small MLP (2–3 layers, ~50K parameters total) that takes the per-head features and outputs a continuous budget vector b ∈ ℝᴴ via softmax, where H is the number of KV heads. The softmax ensures budgets sum to the total budget B.
-
 3. **Eviction policy:** Any existing scorer press (SnapKV, H2O, ExpectedAttention) from KVPress. Each head evicts tokens to meet its allocated budget bₕ. The eviction policy is frozen and not trained.
 
 ### 4.2 Per-Head Feature Vector
@@ -79,11 +81,8 @@ The system has three components that execute sequentially during inference:
 For each KV head h in each layer l, we extract the following features from the prefill pass. All features are scalars, yielding a feature vector f_{l,h} ∈ ℝ⁴ per head:
 
 - **Attention entropy:** H(aₕ) = −Σ aᵢ log(aᵢ) averaged over queries in the observation window. High entropy indicates diffuse attention (head needs more tokens); low entropy indicates focused attention (head can be compressed aggressively).
-
 - **Top-k attention mass:** Fraction of total attention captured by the top-k tokens (k = current budget candidate). Directly measures how much information is retained under compression.
-
 - **Key norm variance:** σ²(‖kᵢ‖) across tokens in the cache. Heads with high key norm variance have more differentiated tokens, suggesting importance varies more and budget allocation matters more.
-
 - **Ada-KV L1 score:** The analytical L1 loss upper bound from Ada-KV (Feng et al., 2024). Included as a feature so the network can learn to improve upon it rather than ignoring it.
 
 The full input to the allocator for one layer is f_l ∈ ℝ^{H×4}. For a model with L layers, we train L independent allocators (one per layer) or a single allocator with layer index as an additional feature. The per-layer approach is preferred for simplicity.
@@ -119,12 +118,11 @@ We adapt the GRPO algorithm (Guo et al., 2025) for our setting. The key differen
 
 The reward signal is the primary design choice. We propose a composite reward:
 
-> *r = accuracy(y, y\*) + λ × budget_efficiency*
+> *r = accuracy(y, y) + λ × budget_efficiency*
 
 Where:
 
-- **accuracy(y, y\*):** Binary correctness for math tasks (AIME, MATH-500) or exact match for RULER synthetic tasks. This is the primary signal.
-
+- **accuracy(y, y):** Binary correctness for math tasks (AIME, MATH-500) or exact match for RULER synthetic tasks. This is the primary signal.
 - **budget_efficiency:** Bonus for allocations that concentrate budget in fewer heads (measured by negative entropy of the budget vector). This encourages the allocator to learn sparse, decisive allocations rather than collapsing to uniform. λ = 0.1 as starting point.
 
 **Alternative reward (for ablation):** Use negative perplexity increase relative to the uncompressed model, similar to ForesightKV's LM loss signal. This is cheaper (no generation needed) but less directly aligned with task performance.
@@ -136,13 +134,9 @@ Where:
 ### 5.1 Codebase and Dependencies
 
 - **Base framework:** Fork NVIDIA KVPress (`github.com/NVIDIA/kvpress`). Provides all eviction methods, AdaKVPress wrapper for per-head budgets, benchmarking infrastructure, and HuggingFace Transformers integration.
-
 - **Variable-length KV kernels:** AdaKV's CUDA kernels (`github.com/FFY0/AdaKV`) using `flash_attn_varlen_func` for efficient inference with non-uniform head budgets.
-
 - **RL training:** Custom GRPO loop in PyTorch (~200–300 lines). The policy is a tiny MLP, not the LLM, so standard RL infra (veRL, OpenRLHF) is overkill. We only need: sample from Dirichlet, compute log-prob, compute advantage, gradient step.
-
 - **Target models:** Llama-3.1-8B-Instruct (8 KV heads, 32 layers, GQA), Qwen-2.5-7B-Instruct. Both supported by KVPress.
-
 - **Evaluation benchmarks:** RULER (synthetic long-context, 13 subtasks), LongBench (16 real-world tasks), AIME 2024/2025 and MATH-500 (reasoning under compression).
 
 ### 5.2 Key Implementation Detail: Integrating with AdaKVPress
@@ -160,16 +154,18 @@ Everything downstream (token scoring, eviction, variable-length KV cache handlin
 
 ### 5.3 Timeline (14 Days)
 
-| Phase | Days | Deliverables |
-|---|---|---|
-| **Setup** | 1–2 | Fork KVPress, verify Ada-KV baseline runs on Snellius. Reproduce Ada-SnapKV numbers on RULER at 20%/40%/60% compression. Set up evaluation pipeline. |
-| **Features** | 3–4 | Implement per-head feature extraction (attention entropy, top-k mass, key norm variance, L1 score). Verify features are informative via correlation analysis with Ada-KV's analytical budgets. |
-| **Allocator** | 4–5 | Implement budget allocator MLP. Wire it into AdaKVPress replacing the analytical computation. Verify forward pass produces valid budget vectors that sum correctly. |
-| **GRPO Loop** | 5–7 | Implement GRPO training: Dirichlet sampling, reward computation (RULER accuracy), advantage normalization, policy gradient update. Debug on small-scale (1 layer, Qwen-3-1.7B) before scaling. |
-| **Training** | 7–9 | Full training on Llama-3.1-8B with RULER training split. Hyperparameter sweep: group size G ∈ {4, 8, 16}, learning rate, temperature init, λ for budget efficiency bonus. Save checkpoints. |
-| **Evaluation** | 9–11 | Benchmark learned allocator vs. baselines (uniform, Ada-KV analytical, HeadKV heuristic, PyramidKV) across all compression ratios on RULER, LongBench, MATH-500. Generate accuracy-vs-compression curves. |
-| **Ablations** | 11–12 | Ablate feature importance (drop each feature), reward function (accuracy-only vs. composite), allocator capacity (1-layer vs. 3-layer MLP), and cross-model transfer (train on Llama, eval on Qwen). |
-| **Writeup** | 13–14 | Technical report with motivation, method, results, and analysis. Prepare figures: accuracy-vs-compression curves, learned budget heatmaps (layer × head), comparison table. |
+
+| Phase          | Days  | Deliverables                                                                                                                                                                                              |
+| -------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Setup**      | 1–2   | Fork KVPress, verify Ada-KV baseline runs on Snellius. Reproduce Ada-SnapKV numbers on RULER at 20%/40%/60% compression. Set up evaluation pipeline.                                                      |
+| **Features**   | 3–4   | Implement per-head feature extraction (attention entropy, top-k mass, key norm variance, L1 score). Verify features are informative via correlation analysis with Ada-KV's analytical budgets.            |
+| **Allocator**  | 4–5   | Implement budget allocator MLP. Wire it into AdaKVPress replacing the analytical computation. Verify forward pass produces valid budget vectors that sum correctly.                                       |
+| **GRPO Loop**  | 5–7   | Implement GRPO training: Dirichlet sampling, reward computation (RULER accuracy), advantage normalization, policy gradient update. Debug on small-scale (1 layer, Qwen-3-1.7B) before scaling.            |
+| **Training**   | 7–9   | Full training on Llama-3.1-8B with RULER training split. Hyperparameter sweep: group size G ∈ {4, 8, 16}, learning rate, temperature init, λ for budget efficiency bonus. Save checkpoints.               |
+| **Evaluation** | 9–11  | Benchmark learned allocator vs. baselines (uniform, Ada-KV analytical, HeadKV heuristic, PyramidKV) across all compression ratios on RULER, LongBench, MATH-500. Generate accuracy-vs-compression curves. |
+| **Ablations**  | 11–12 | Ablate feature importance (drop each feature), reward function (accuracy-only vs. composite), allocator capacity (1-layer vs. 3-layer MLP), and cross-model transfer (train on Llama, eval on Qwen).      |
+| **Writeup**    | 13–14 | Technical report with motivation, method, results, and analysis. Prepare figures: accuracy-vs-compression curves, learned budget heatmaps (layer × head), comparison table.                               |
+
 
 ---
 
@@ -192,24 +188,23 @@ Everything downstream (token scoring, eviction, variable-length KV cache handlin
 ### 6.3 Key Experiments
 
 1. **Main result:** Accuracy-vs-compression curves for all methods on RULER and LongBench. Target: beat Ada-KV by 2–5 points at 20–40% retention where the gap matters most.
-
 2. **Reasoning under compression:** MATH-500 and AIME 2024 with Qwen-2.5-7B reasoning traces. Show that learned allocation better preserves reasoning chains than analytical methods.
-
 3. **Budget heatmap analysis:** Visualize learned allocations (layer × head matrix) for different input types. Show the allocator learns interpretable patterns (e.g., retrieval heads get more budget on needle-in-haystack tasks).
-
 4. **Ablations:** Feature dropout (which features matter?), reward function variants, allocator capacity, cross-model transfer.
 
 ---
 
 ## 7. Risks and Mitigations
 
-| Risk | Severity | Mitigation |
-|---|---|---|
-| **GRPO training instability** | High | The continuous action space (Dirichlet) may have high variance gradients. Mitigation: start with large group size G=16, use baseline subtraction, clip advantages. Fallback: switch to PPO with a tiny value network. |
-| **Marginal gains over Ada-KV** | Medium | The analytical L1 bound may be near-optimal, leaving little room for improvement. Mitigation: focus evaluation on low compression ratios (20–40%) and reasoning tasks where analytical bounds are known to be loose. If gains are <1 point, pivot to demonstrating the allocator learns interpretable patterns that explain why Ada-KV works. |
-| **Training cost** | Medium | Each GRPO iteration requires G full generation rollouts per prompt. For reasoning tasks with long outputs, this is expensive. Mitigation: train on RULER (short outputs) first, then fine-tune on reasoning. Use perplexity reward as cheaper proxy during early training. |
-| **Allocator collapses to uniform** | Low | Softmax with insufficient training converges to uniform. Mitigation: initialize temperature τ low (0.5) to encourage peaky initial allocations. Add budget efficiency bonus in reward to penalize entropy. |
-| **Overfitting to training tasks** | Medium | Allocator may memorize RULER patterns. Mitigation: train on diverse RULER subtasks, evaluate on held-out LongBench tasks. Report zero-shot transfer results explicitly. |
+
+| Risk                               | Severity | Mitigation                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GRPO training instability**      | High     | The continuous action space (Dirichlet) may have high variance gradients. Mitigation: start with large group size G=16, use baseline subtraction, clip advantages. Fallback: switch to PPO with a tiny value network.                                                                                                                         |
+| **Marginal gains over Ada-KV**     | Medium   | The analytical L1 bound may be near-optimal, leaving little room for improvement. Mitigation: focus evaluation on low compression ratios (20–40%) and reasoning tasks where analytical bounds are known to be loose. If gains are <1 point, pivot to demonstrating the allocator learns interpretable patterns that explain why Ada-KV works. |
+| **Training cost**                  | Medium   | Each GRPO iteration requires G full generation rollouts per prompt. For reasoning tasks with long outputs, this is expensive. Mitigation: train on RULER (short outputs) first, then fine-tune on reasoning. Use perplexity reward as cheaper proxy during early training.                                                                    |
+| **Allocator collapses to uniform** | Low      | Softmax with insufficient training converges to uniform. Mitigation: initialize temperature τ low (0.5) to encourage peaky initial allocations. Add budget efficiency bonus in reward to penalize entropy.                                                                                                                                    |
+| **Overfitting to training tasks**  | Medium   | Allocator may memorize RULER patterns. Mitigation: train on diverse RULER subtasks, evaluate on held-out LongBench tasks. Report zero-shot transfer results explicitly.                                                                                                                                                                       |
+
 
 ---
 
@@ -242,3 +237,4 @@ Everything downstream (token scoring, eviction, variable-length KV cache handlin
 8. NVIDIA KVPress: Devoto et al. (2025). Expected Attention: KV Cache Compression. github.com/NVIDIA/kvpress
 9. R-KV: Cai et al. (2025). Redundancy-aware KV Cache Compression for Reasoning Models. NeurIPS 2025. arXiv:2505.24133
 10. SCBench: Yue et al. (2025). Can't See the Forest for the Trees: KV Cache-Centric Benchmark. ICLR 2025.
+
