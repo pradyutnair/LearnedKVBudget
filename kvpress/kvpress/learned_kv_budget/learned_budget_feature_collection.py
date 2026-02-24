@@ -104,7 +104,7 @@ def align_kv_to_attention_heads(kv_tensor: torch.Tensor, num_attention_heads: in
 
 def compute_adakv_target_proxy_from_attentions(
     attentions: torch.Tensor,
-    eps: float,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     """Compute a stable target proxy from attentions with shape `(B, H, Q, K)`.
 
